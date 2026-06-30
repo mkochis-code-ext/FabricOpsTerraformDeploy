@@ -31,3 +31,9 @@ variable "skip_capacity_state_validation" {
   type        = bool
   default     = false
 }
+
+variable "admin_group_id" {
+  description = "Object ID of an Entra security group to grant the Admin role on the Workspace. Leave null to skip the assignment."
+  type        = string
+  default     = null
+}

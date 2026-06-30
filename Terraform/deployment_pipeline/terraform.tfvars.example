@@ -17,6 +17,9 @@ backend_container_name       = "tfstate"
 deployment_pipeline_display_name = "FabricOps-Pipeline"
 deployment_pipeline_description  = "Deployment pipeline managed by Terraform."
 
+# Optional: Entra security group granted the Admin role on the deployment pipeline.
+# admin_group_id = "00000000-0000-0000-0000-000000000000"
+
 # Environments currently wired into the pipeline. The CI pipeline grows this as
 # environments come online: ["dev","nonprod"] for the Non-Prod promotion, then
 # ["dev","nonprod","prod"] for the Prod promotion (which recreates the pipeline).

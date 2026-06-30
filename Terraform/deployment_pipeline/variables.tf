@@ -65,6 +65,12 @@ variable "deployment_pipeline_description" {
   default     = "Deployment pipeline managed by Terraform."
 }
 
+variable "admin_group_id" {
+  description = "Object ID of an Entra security group granted the Admin role on the deployment pipeline. Leave null to skip."
+  type        = string
+  default     = null
+}
+
 variable "stages" {
   description = <<-EOT
     Ordered array of deployment pipeline stages (between 2 and 10). Stage names are
@@ -110,11 +116,13 @@ variable "stages" {
 
 variable "active_environments" {
   description = <<-EOT
-    Environments whose stages are currently wired into the deployment pipeline. The
-    pipeline is grown incrementally as environments come online: ["dev", "nonprod"]
+    Environments whose stages are (re)wired into the deployment pipeline on this run.
+    The pipeline grows incrementally as environments come online: ["dev", "nonprod"]
     when Non-Prod is deployed, then ["dev", "nonprod", "prod"] when Prod is deployed.
-    Only the remote state of listed environments is read. Stages whose
-    source_environment is not active (and stages with no source_environment) are dropped.
+    Only the remote state of listed environments is read; their stages are refreshed
+    from that state. The pipeline is grow-only: any stage already present in the live
+    pipeline is detected and preserved even when its environment is not listed here, so
+    re-running an earlier stage (e.g. Non-Prod) never drops a later stage (e.g. Prod).
   EOT
   type        = list(string)
   default     = ["dev", "nonprod", "prod"]

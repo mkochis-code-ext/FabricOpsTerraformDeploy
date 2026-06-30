@@ -52,8 +52,11 @@ variable "skip_capacity_state_validation" {
   default     = false
 }
 
-# ---------------------------------------------------------------------------
-# Git integration (Azure DevOps -> Dev workspace)
+variable "admin_group_id" {
+  description = "Object ID of an Entra security group granted the Admin role on the workspace. Leave null to skip."
+  type        = string
+  default     = null
+}
 # The Dev workspace is connected to the ADO repo so its content is sourced
 # from Git. Promotions to Non-Prod/Prod are handled by the deployment pipeline.
 # ---------------------------------------------------------------------------

@@ -3,3 +3,7 @@ resource_group_name  = "rg-fabricops-tfstate"
 storage_account_name = "stfabricopstfstate"
 container_name       = "tfstate"
 key                  = "fabric/prod.tfstate"
+# Authenticate with Entra ID (RBAC) instead of storage account keys, which are
+# blocked by policy. The caller needs the "Storage Blob Data Contributor" role
+# on the state storage account.
+use_azuread_auth     = true

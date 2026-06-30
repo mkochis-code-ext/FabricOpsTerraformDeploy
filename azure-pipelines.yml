@@ -24,16 +24,27 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  # Service connection configured with Workload Identity Federation (OIDC).
-  - name: serviceConnection
-    value: 'fabric-azure-connection'
-  # Remote state backend (Azure Storage).
-  - name: backendResourceGroup
-    value: 'rg-fabricops-tfstate'
-  - name: backendStorageAccount
-    value: 'stfabricopstfstate'
-  - name: backendContainerName
-    value: 'tfstate'
+  # Shared, non-secret configuration sourced from the 'fabricops-config' variable group
+  # (Azure DevOps -> Pipelines -> Library). Create and populate it before the first run
+  # (see README -> One-time setup). Authentication uses OIDC, so this group holds NO secrets.
+  # The group must define:
+  #   serviceConnection        - ARM service connection (Workload Identity Federation / OIDC)
+  #   backendResourceGroup     - Resource group holding the Terraform state storage account
+  #   backendStorageAccount    - Storage account for Terraform remote state
+  #   backendContainerName     - Blob container for Terraform remote state
+  #   fabric_capacity_id       - Fabric capacity GUID assigned to the Dev workspace
+  #   admin_security_group_id  - Entra group object ID granted Admin on workspaces & pipeline
+  #   git_connection_id        - Fabric connection ID for the Dev workspace Git integration
+  #   git_organization_name    - Azure DevOps organization backing the Dev workspace
+  #   git_project_name         - Azure DevOps project backing the Dev workspace
+  #   git_repository_name      - Azure DevOps repository backing the Dev workspace
+  #   git_branch_name          - Branch the Dev workspace tracks
+  - group: fabricops-config
+  # Terraform version, used as the hashicorp/terraform container image tag. Terraform runs
+  # via `docker run` inside the AzureCLI tasks (the TerraformInstaller marketplace task is
+  # restricted in this org), so no Terraform install is needed on the agent.
+  - name: TF_VERSION
+    value: '1.9.8'
 
 stages:
   # Environments run sequentially, each fully completing Plan -> Apply -> FabricDeploy
@@ -54,6 +65,17 @@ stages:
       backendContainerName: '$(backendContainerName)'
       backendKey: 'fabric/dev.tfstate'
       fabricDeployMode: 'git-sync'
+      # Dev-only: capacity assignment and Git integration values for the Dev workspace
+      # root, sourced from the 'fabricops-config' variable group. Captured at plan time
+      # and baked into the saved plan.
+      terraformVars: >-
+        -var="capacity_id=$(fabric_capacity_id)"
+        -var="admin_group_id=$(admin_security_group_id)"
+        -var="git_connection_id=$(git_connection_id)"
+        -var="git_organization_name=$(git_organization_name)"
+        -var="git_project_name=$(git_project_name)"
+        -var="git_repository_name=$(git_repository_name)"
+        -var="git_branch_name=$(git_branch_name)"
 
   # -------------------------- Non-Prod -------------------------
   - template: .azuredevops/templates/fabric-env-stages.yml
@@ -69,6 +91,11 @@ stages:
       activeEnvironments: '["dev","nonprod"]'
       sourceStage: 'Development'
       targetStage: 'Test'
+      # Assign the Fabric capacity and grant the admin group on the Non-Prod workspace
+      # (sourced from 'fabricops-config').
+      terraformVars: >-
+        -var="capacity_id=$(fabric_capacity_id)"
+        -var="admin_group_id=$(admin_security_group_id)"
       dependsOn:
         - FabricDeploy_dev
 
@@ -86,5 +113,10 @@ stages:
       activeEnvironments: '["dev","nonprod","prod"]'
       sourceStage: 'Test'
       targetStage: 'Production'
+      # Assign the Fabric capacity and grant the admin group on the Prod workspace
+      # (sourced from 'fabricops-config').
+      terraformVars: >-
+        -var="capacity_id=$(fabric_capacity_id)"
+        -var="admin_group_id=$(admin_security_group_id)"
       dependsOn:
         - FabricDeploy_nonprod

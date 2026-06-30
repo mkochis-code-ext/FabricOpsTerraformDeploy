@@ -74,16 +74,24 @@ template [.azuredevops/templates/fabric-env-stages.yml](.azuredevops/templates/f
 | **nonprod** | `pipeline-deploy` | Applies the deployment-pipeline root with `active_environments = ["dev","nonprod"]`, then promotes **Development → Test**. |
 | **prod** | `pipeline-deploy` | Applies the deployment-pipeline root with `active_environments = ["dev","nonprod","prod"]`, then promotes **Test → Production**. |
 
-> **Why the pipeline grows incrementally:** `fabric_deployment_pipeline.stages` is *ForceNew* —
-> changing the stage list recreates the pipeline. The pipeline is wired with only the stages
-> for environments that are live, expanding from two stages (when Non-Prod deploys) to three
-> (when Prod deploys). Already-promoted workspace content is unaffected by the recreation;
-> only the pipeline object's deployment history resets.
+> **Why the pipeline grows incrementally — and never shrinks:** `fabric_deployment_pipeline.stages`
+> is *ForceNew* — changing the stage list recreates the pipeline. The pipeline is wired with only
+> the stages for environments that are live, expanding from two stages (when Non-Prod deploys) to
+> three (when Prod deploys). Crucially, the deployment-pipeline root **detects the stages already
+> present on the live pipeline and preserves them**, so re-running an earlier environment can never
+> tear a later stage back off — the pipeline is *grow-only*. See
+> [Building the deployment pipeline incrementally](#building-the-deployment-pipeline-incrementally).
 
 Authentication uses **Workload Identity Federation (OIDC)** — no secrets stored. The
 `AzureCLI@2` task exposes the federated token, which is surfaced to Terraform's `azurerm`
 backend and the Fabric provider as environment variables, and to the PowerShell scripts as a
 Fabric access token.
+
+Shared **non-secret** configuration (the service connection name, the state backend names, and
+the Dev Git-integration identifiers) comes from the `fabricops-config`
+[variable group](#4-create-the-pipeline-variable-group-fabricops-config) — no secrets are
+stored there either. `tenant_id` and `client_id` are injected automatically from the service
+connection at runtime.
 
 ---
 
@@ -117,13 +125,15 @@ FabricOpsTerraformDeploy/
 
 | Requirement | Detail |
 |-------------|--------|
-| **Terraform** | `>= 1.5.0` ([install](https://developer.hashicorp.com/terraform/install)) |
+| **Terraform** | `>= 1.5.0`. In CI, Terraform runs via the `hashicorp/terraform` container image (tag set by the `TF_VERSION` pipeline variable) — no install needed on the agent. For [local runs](#running-locally), [install Terraform](https://developer.hashicorp.com/terraform/install). |
 | **Microsoft Fabric** | A tenant with Fabric enabled, and (optionally) a [Fabric capacity](https://learn.microsoft.com/fabric/enterprise/licenses) to assign |
 | **Entra ID service principal** | Used for all automation. Needs Fabric workspace admin rights and permission to create/manage deployment pipelines |
 | **Azure subscription** | Hosts the Azure Storage account used for Terraform remote state |
 | **Azure DevOps** | Project + repo (this one), plus a service connection with Workload Identity Federation |
+| **Azure DevOps variable group** | `fabricops-config` holding non-secret pipeline config (service connection, backend names, Dev Git values) — see [setup](#4-create-the-pipeline-variable-group-fabricops-config) |
 | **PowerShell 7+** | The deploy scripts target `pwsh` (`pscore`); used automatically by the ADO agent |
 | **Azure CLI** | Used by the pipeline to obtain the Fabric token (`az account get-access-token`) |
+| **Docker** | Must be available on the build agent — the pipeline runs Terraform through the `hashicorp/terraform` image inside the `AzureCLI@2` tasks (the `TerraformInstaller` marketplace task is not used). |
 
 ### Required service principal permissions
 
@@ -146,7 +156,8 @@ az storage account create `
   --kind StorageV2
 az storage container create `
   --name tfstate `
-  --account-name stfabricopstfstate
+  --account-name stfabricopstfstate `
+  --auth-mode login
 ```
 
 > Names must match the `backend*` variables in [azure-pipelines.yml](azure-pipelines.yml)
@@ -154,6 +165,18 @@ az storage container create `
 
 State keys per root: `fabric/dev.tfstate`, `fabric/nonprod.tfstate`, `fabric/prod.tfstate`,
 `fabric/deployment-pipeline.tfstate`.
+
+> **Key-less (Entra ID) state access.** The Terraform backend authenticates to this storage
+> account with Entra ID (`use_azuread_auth = true`), not account keys — `listKeys` is denied by
+> policy. Grant the pipeline's service principal the **Storage Blob Data Contributor** role on the
+> state storage account (do this after creating the service connection in step 3):
+>
+> ```powershell
+> az role assignment create `
+>   --assignee <pipeline-spn-object-id> `
+>   --role "Storage Blob Data Contributor" `
+>   --scope $(az storage account show --name stfabricopstfstate --resource-group rg-fabricops-tfstate --query id -o tsv)
+> ```
 
 ### 2. Create the Fabric Git connection
 
@@ -168,15 +191,69 @@ Create an **Azure Resource Manager** service connection named `fabric-azure-conn
 pipeline authenticate to both Azure (for state) and Fabric without storing secrets.
 See [Workload identity federation](https://learn.microsoft.com/azure/devops/pipelines/library/connect-to-azure?view=azure-devops#create-an-azure-resource-manager-service-connection-using-workload-identity-federation).
 
-### 4. Create ADO environments for approvals (optional but recommended)
+### 4. Create the pipeline variable group (`fabricops-config`)
+
+The pipeline reads its shared, **non-secret** configuration from an Azure DevOps **variable
+group** named `fabricops-config` (Pipelines → Library). Authentication still uses OIDC, so this
+group holds **no secrets** — only identifiers and names.
+
+| Variable | Example | Used by |
+|----------|---------|---------|
+| `serviceConnection` | `fabric-azure-connection` | All stages (Azure/Fabric auth) |
+| `backendResourceGroup` | `rg-fabricops-tfstate` | `terraform init` backend |
+| `backendStorageAccount` | `stfabricopstfstate` | `terraform init` backend |
+| `backendContainerName` | `tfstate` | `terraform init` backend |
+| `git_connection_id` | `11111111-1111-1111-1111-111111111111` | Dev workspace Git integration |
+| `git_organization_name` | `MyOrg` | Dev workspace Git integration |
+| `git_project_name` | `MyProject` | Dev workspace Git integration |
+| `git_repository_name` | `FabricOpsTerraformDeploy` | Dev workspace Git integration |
+| `git_branch_name` | `main` | Dev workspace Git integration |
+
+Create and populate it with the Azure CLI (`az devops` extension):
+
+```powershell
+az devops configure --defaults organization=https://dev.azure.com/MyOrg project=MyProject
+
+az pipelines variable-group create `
+  --name fabricops-config `
+  --authorize true `
+  --variables `
+    serviceConnection=fabric-azure-connection `
+    backendResourceGroup=rg-fabricops-tfstate `
+    backendStorageAccount=stfabricopstfstate `
+    backendContainerName=tfstate `
+    git_connection_id=11111111-1111-1111-1111-111111111111 `
+    git_organization_name=MyOrg `
+    git_project_name=MyProject `
+    git_repository_name=FabricOpsTerraformDeploy `
+    git_branch_name=main
+```
+
+> `--authorize true` lets the pipeline consume the group without a manual authorization prompt.
+> Keep every value **non-secret** — if you mark one secret, the Terraform `-var` substitution
+> (e.g. `$(git_connection_id)`) won't expand inside the inline scripts.
+
+Update a value later with:
+
+```powershell
+az pipelines variable-group variable update `
+  --group-id <id> --name git_branch_name --value main
+```
+
+### 5. Create ADO environments for approvals (optional but recommended)
 
 The Apply and FabricDeploy stages target ADO *environments* named `fabric-dev`,
 `fabric-nonprod`, and `fabric-prod`. Create these under **Pipelines → Environments** and add
 approval checks where you want manual gates (typically Non-Prod and Prod).
 
-### 5. Provide environment configuration
+### 6. Provide environment configuration (local runs only)
 
-Copy each `*.example` to a real (gitignored) file and fill in your values:
+In Azure DevOps the pipeline supplies its variables from the service connection
+(`tenant_id`/`client_id`) and the `fabricops-config` variable group (Dev Git values + backend
+names), so **no `.tfvars` are needed in CI**. The `.tfvars`/`.hcl` files are **gitignored** and
+used only when [running locally](#running-locally).
+
+For local runs, copy each `*.example` to a real (gitignored) file and fill in your values:
 
 ```powershell
 Copy-Item Terraform/workspaces/dev/terraform.tfvars.example Terraform/workspaces/dev/terraform.tfvars
@@ -295,23 +372,51 @@ exists in remote state.
 
 ### How `active_environments` shapes the pipeline
 
-The deployment-pipeline root only:
+The deployment-pipeline root:
 
-1. reads the **remote state** of the environments listed in `active_environments`
-   (see [Terraform/deployment_pipeline/remote_state.tf](Terraform/deployment_pipeline/remote_state.tf)), and
-2. keeps the `stages` whose `source_environment` is in that list, dropping the rest
-   (see the `active_stages` local in [Terraform/deployment_pipeline/main.tf](Terraform/deployment_pipeline/main.tf)).
+1. reads the **remote state** of the environments listed in `active_environments` to get their
+   current workspace IDs
+   (see [Terraform/deployment_pipeline/remote_state.tf](Terraform/deployment_pipeline/remote_state.tf)),
+2. **looks up the live deployment pipeline** (if one already exists) and reads the stages it
+   currently has — using the `fabric_deployment_pipelines` list data source (which returns empty,
+   rather than erroring, before the pipeline exists) plus the singular `fabric_deployment_pipeline`
+   data source, and
+3. wires the pipeline to the **union** of the requested `active_environments` and every stage
+   already present on the live pipeline — it is **grow-only** and never removes a stage
+   (see the `effective_environments` local in [Terraform/deployment_pipeline/main.tf](Terraform/deployment_pipeline/main.tf)).
 
-So the same configuration produces a different pipeline depending on which environments are active:
+An active environment's stage is (re)bound from fresh remote state; a stage that is present only
+because it is already live keeps its existing workspace assignment (so its remote state does not
+even need to be read on that run).
 
-| `active_environments` | Stages created | Bound workspaces |
-|-----------------------|----------------|------------------|
-| `["dev","nonprod"]` | Development, Test | Dev, Non-Prod |
-| `["dev","nonprod","prod"]` | Development, Test, Production | Dev, Non-Prod, Prod |
+So the requested `active_environments` sets the *minimum* shape of the pipeline, while the live
+pipeline's current stages set the *floor* it can never drop below:
+
+| `active_environments` (this run) | Stages already live | Resulting stages |
+|----------------------------------|---------------------|------------------|
+| `["dev","nonprod"]` | _none (first Non-Prod run)_ | Development, Test |
+| `["dev","nonprod","prod"]` | Development, Test | Development, Test, Production |
+| `["dev","nonprod"]` | Development, Test, Production | Development, Test, Production _(Prod preserved)_ |
 
 > A deployment pipeline must have **at least two stages**, which is why the pipeline first
 > appears during the **Non-Prod** run (Dev alone would be a single stage). Dev's content deploy
 > is a Git sync, so it needs no pipeline.
+
+### Why grow-only detection is critical
+
+Each environment passes a **fixed** `active_environments` to the deployment-pipeline root
+([azure-pipelines.yml](azure-pipelines.yml)): Non-Prod always passes `["dev","nonprod"]` and Prod
+always passes `["dev","nonprod","prod"]`. Those values do **not** change on later runs.
+
+Without grow-only detection, a re-run is destructive. After a full first deployment the live
+pipeline has all three stages, but the **Non-Prod** stage runs first and passes only
+`["dev","nonprod"]`. Terraform would then compute a two-stage pipeline, see the Production stage
+as "removed", and — because `stages` is ForceNew — **delete and recreate the pipeline without
+Production**. The pipeline would be left in a broken, Prod-less state until the Prod stage ran
+again and rebuilt it. (This is the exact failure this design prevents.)
+
+By reading the live pipeline and taking the **union** with the requested environments, the
+Non-Prod re-run keeps all three stages, the plan is a no-op, and Production is never dropped.
 
 ### Initial run (greenfield) — stage by stage
 
@@ -343,23 +448,26 @@ workspaces is untouched. What resets is the pipeline object's own deployment his
 
 ### Second and subsequent runs (steady state)
 
-Once Prod has been deployed at least once, `active_environments` is `["dev","nonprod","prod"]`
-on every environment's run and the pipeline already has all three stages. Now Terraform's plan
-for the deployment-pipeline root is a **no-op** (the stage list is unchanged), so:
+Once Prod has been deployed at least once, the live pipeline has all three stages. On later runs
+each environment **still passes its own fixed `active_environments`** — Non-Prod passes
+`["dev","nonprod"]`, Prod passes `["dev","nonprod","prod"]` — but the grow-only detection folds in
+the stages already present, so the effective stage list stays at all three. Terraform's plan for
+the deployment-pipeline root is therefore a **no-op**:
 
-- **No recreation happens** — the pipeline is stable across runs.
+- **No recreation (and no shrink) happens** — the pipeline is stable across runs.
 - Each environment's FabricDeploy stage still runs, but the `terraform apply` of the pipeline
   root simply confirms the existing state, and the only meaningful action is the **promotion**:
 
-| Order | Environment | Pipeline `apply` | Promotion |
-|-------|-------------|------------------|-----------|
-| 1 | **dev** | _n/a_ | Git sync pulls the latest commit into Dev. |
-| 2 | **nonprod** | no-op (3 stages already present) | **Development → Test** |
-| 3 | **prod** | no-op (3 stages already present) | **Test → Production** |
+| Order | Environment | `active_environments` passed | Effective stages (grow-only) | Pipeline `apply` | Promotion |
+|-------|-------------|------------------------------|------------------------------|------------------|-----------|
+| 1 | **dev** | _n/a_ | _n/a_ | _n/a_ | Git sync pulls the latest commit into Dev. |
+| 2 | **nonprod** | `["dev","nonprod"]` | dev, nonprod, **prod** | no-op | **Development → Test** |
+| 3 | **prod** | `["dev","nonprod","prod"]` | dev, nonprod, prod | no-op | **Test → Production** |
 
 In other words: the **first** run *builds* the pipeline (and recreates it once when Prod is
 added), while **every run thereafter** just *uses* it to promote content forward — Dev via Git
-sync, then Test and Production via stage promotions.
+sync, then Test and Production via stage promotions. The grow-only detection is what keeps the
+Non-Prod re-run (step 2) from dropping the Production stage it does not list.
 
 > **Changing stages later** (renaming a stage, reordering, adding a fourth) will again trigger a
 > ForceNew recreation on the next run because of the provider's behavior — plan output will show
@@ -388,8 +496,10 @@ for supported item types and the on-disk format.
 | `terraform init` fails on the backend | Storage account/container/key don't exist or the SPN lacks **Storage Blob Data Contributor**. |
 | Fabric provider auth errors | Tenant settings disallow service principals, or the SPN isn't a workspace admin. |
 | Git connection fails for the SPN | Inline Git credentials aren't supported for SPNs — supply a valid `git_connection_id` (`ConfiguredConnection`). |
+| Dev plan shows `null` Git values / Git integration not created | Populate the `fabricops-config` variable group (especially `git_connection_id`) and ensure the variables are **not** marked secret. |
 | `source_environment` state not found | Apply the workspace roots **before** the deployment-pipeline root; confirm `state_keys` match the backend keys. |
-| Pipeline recreated unexpectedly | Expected — `stages` is ForceNew; expanding `active_environments` recreates the pipeline definition (content is preserved). |
+| Pipeline recreated unexpectedly | Expected only the first time Prod is added — `stages` is ForceNew, so expanding the stage list recreates the pipeline definition (workspace content is preserved). Re-running an earlier environment does **not** recreate or shrink it: the root is grow-only and preserves already-live stages. |
+| Production stage missing after a re-run | Should no longer happen — the grow-only detection in the deployment-pipeline root preserves live stages. If it recurs, confirm the `fabric_deployment_pipelines`/`fabric_deployment_pipeline` data-source lookups can see the pipeline (SPN must have at least read access to it). |
 | Transient `context deadline exceeded` on init | Registry timeout — re-run `terraform init`. |
 
 ---

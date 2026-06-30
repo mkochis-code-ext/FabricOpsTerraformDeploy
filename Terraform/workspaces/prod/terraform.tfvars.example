@@ -7,3 +7,6 @@ workspace_description  = "Production workspace managed by Terraform."
 
 # Optional: assign a dedicated capacity.
 # capacity_id = "00000000-0000-0000-0000-000000000000"
+
+# Optional: Entra security group granted the Admin role on the workspace.
+# admin_group_id = "00000000-0000-0000-0000-000000000000"

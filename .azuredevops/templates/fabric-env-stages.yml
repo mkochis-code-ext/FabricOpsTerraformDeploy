@@ -27,6 +27,9 @@ parameters:
   - name: fabricDeployMode   # none | git-sync | pipeline-deploy
     type: string
     default: 'none'
+  - name: terraformVars      # Extra -var flags appended to the workspace root's `terraform plan`
+    type: string
+    default: ''
   # --- pipeline-deploy mode only ---
   - name: pipelineWorkingDirectory  # Path to the deployment_pipeline Terraform root
     type: string
@@ -58,11 +61,6 @@ stages:
       - job: terraform_plan
         displayName: 'Terraform Plan'
         steps:
-          - task: TerraformInstaller@1
-            displayName: 'Install Terraform'
-            inputs:
-              terraformVersion: 'latest'
-
           - task: AzureCLI@2
             displayName: 'Terraform Init & Plan'
             inputs:
@@ -87,6 +85,20 @@ stages:
                 export FABRIC_OIDC_TOKEN="$idToken"
                 export FABRIC_USE_OIDC=true
 
+                # Run Terraform through the official container image instead of a locally
+                # installed binary (the TerraformInstaller marketplace task is restricted).
+                # The whole repo is mounted so relative module sources (../../modules) resolve;
+                # docker is preinstalled on the agent and OIDC env vars are forwarded with -e.
+                TF_IMAGE="hashicorp/terraform:$(TF_VERSION)"
+                REPO_ROOT="$(Build.SourcesDirectory)"
+                terraform() {
+                  docker run --rm \
+                    -e ARM_TENANT_ID -e ARM_CLIENT_ID -e ARM_OIDC_TOKEN -e ARM_USE_OIDC -e ARM_SUBSCRIPTION_ID \
+                    -e FABRIC_TENANT_ID -e FABRIC_CLIENT_ID -e FABRIC_OIDC_TOKEN -e FABRIC_USE_OIDC \
+                    -v "$REPO_ROOT:/repo" -w "/repo/${PWD#$REPO_ROOT/}" \
+                    "$TF_IMAGE" "$@"
+                }
+
                 terraform init -input=false \
                   -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
                   -backend-config="storage_account_name=${{ parameters.backendStorageAccount }}" \
@@ -96,7 +108,8 @@ stages:
                 terraform plan -input=false -out=tfplan \
                   -var="tenant_id=$tenantId" \
                   -var="client_id=$servicePrincipalId" \
-                  -var="use_oidc=true"
+                  -var="use_oidc=true" \
+                  ${{ parameters.terraformVars }}
 
           - task: PublishPipelineArtifact@1
             displayName: 'Publish Terraform Plan'
@@ -119,11 +132,6 @@ stages:
             deploy:
               steps:
                 - checkout: self
-
-                - task: TerraformInstaller@1
-                  displayName: 'Install Terraform'
-                  inputs:
-                    terraformVersion: 'latest'
 
                 - download: current
                   artifact: 'tfplan-${{ parameters.environment }}'
@@ -149,6 +157,17 @@ stages:
                       export FABRIC_CLIENT_ID="$servicePrincipalId"
                       export FABRIC_OIDC_TOKEN="$idToken"
                       export FABRIC_USE_OIDC=true
+
+                      # Run Terraform through the official container image (see Plan stage).
+                      TF_IMAGE="hashicorp/terraform:$(TF_VERSION)"
+                      REPO_ROOT="$(Build.SourcesDirectory)"
+                      terraform() {
+                        docker run --rm \
+                          -e ARM_TENANT_ID -e ARM_CLIENT_ID -e ARM_OIDC_TOKEN -e ARM_USE_OIDC -e ARM_SUBSCRIPTION_ID \
+                          -e FABRIC_TENANT_ID -e FABRIC_CLIENT_ID -e FABRIC_OIDC_TOKEN -e FABRIC_USE_OIDC \
+                          -v "$REPO_ROOT:/repo" -w "/repo/${PWD#$REPO_ROOT/}" \
+                          "$TF_IMAGE" "$@"
+                      }
 
                       terraform init -input=false \
                         -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
@@ -208,11 +227,6 @@ stages:
 
                   # ------------- pipeline-deploy (Non-Prod / Prod) ------------
                   - ${{ if eq(parameters.fabricDeployMode, 'pipeline-deploy') }}:
-                    - task: TerraformInstaller@1
-                      displayName: 'Install Terraform'
-                      inputs:
-                        terraformVersion: 'latest'
-
                     - task: AzureCLI@2
                       displayName: 'Apply Deployment Pipeline'
                       inputs:
@@ -235,6 +249,17 @@ stages:
                           export FABRIC_OIDC_TOKEN="$idToken"
                           export FABRIC_USE_OIDC=true
 
+                          # Run Terraform through the official container image (see Plan stage).
+                          TF_IMAGE="hashicorp/terraform:$(TF_VERSION)"
+                          REPO_ROOT="$(Build.SourcesDirectory)"
+                          terraform() {
+                            docker run --rm \
+                              -e ARM_TENANT_ID -e ARM_CLIENT_ID -e ARM_OIDC_TOKEN -e ARM_USE_OIDC -e ARM_SUBSCRIPTION_ID \
+                              -e FABRIC_TENANT_ID -e FABRIC_CLIENT_ID -e FABRIC_OIDC_TOKEN -e FABRIC_USE_OIDC \
+                              -v "$REPO_ROOT:/repo" -w "/repo/${PWD#$REPO_ROOT/}" \
+                              "$TF_IMAGE" "$@"
+                          }
+
                           terraform init -input=false \
                             -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
                             -backend-config="storage_account_name=${{ parameters.backendStorageAccount }}" \
@@ -245,6 +270,7 @@ stages:
                             -var="tenant_id=$tenantId" \
                             -var="client_id=$servicePrincipalId" \
                             -var="use_oidc=true" \
+                            -var="admin_group_id=$(admin_security_group_id)" \
                             -var="backend_resource_group_name=${{ parameters.backendResourceGroup }}" \
                             -var="backend_storage_account_name=${{ parameters.backendStorageAccount }}" \
                             -var="backend_container_name=${{ parameters.backendContainerName }}" \

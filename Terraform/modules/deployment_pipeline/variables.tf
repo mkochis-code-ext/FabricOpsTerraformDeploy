@@ -23,3 +23,9 @@ variable "stages" {
     error_message = "A deployment pipeline must contain between 2 and 10 stages."
   }
 }
+
+variable "admin_group_id" {
+  description = "Object ID of an Entra security group to grant the Admin role on the Deployment Pipeline. Leave null to skip the assignment."
+  type        = string
+  default     = null
+}
