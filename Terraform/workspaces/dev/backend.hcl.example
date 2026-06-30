@@ -1,0 +1,6 @@
+# Example backend configuration for the Dev environment.
+# Copy to dev.backend.hcl (gitignored) or pass values via -backend-config in CI.
+resource_group_name  = "rg-fabricops-tfstate"
+storage_account_name = "stfabricopstfstate"
+container_name       = "tfstate"
+key                  = "fabric/dev.tfstate"

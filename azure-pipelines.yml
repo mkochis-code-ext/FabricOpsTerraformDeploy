@@ -1,0 +1,90 @@
+# Azure DevOps pipeline that deploys Fabric workspaces with Terraform.
+#
+# For each workspace environment (dev, nonprod, prod) the pipeline runs three stages:
+#   1. Plan         - terraform init + plan
+#   2. Apply        - terraform apply
+#   3. FabricDeploy - publish Fabric item definitions to the workspace
+#
+# Environments are deployed sequentially: nonprod depends on dev, prod depends on nonprod.
+# Stage logic lives in .azuredevops/templates/fabric-env-stages.yml.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - Terraform/**
+      - Fabric/**
+      - scripts/**
+      - azure-pipelines.yml
+      - .azuredevops/**
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Service connection configured with Workload Identity Federation (OIDC).
+  - name: serviceConnection
+    value: 'fabric-azure-connection'
+  # Remote state backend (Azure Storage).
+  - name: backendResourceGroup
+    value: 'rg-fabricops-tfstate'
+  - name: backendStorageAccount
+    value: 'stfabricopstfstate'
+  - name: backendContainerName
+    value: 'tfstate'
+
+stages:
+  # Environments run sequentially, each fully completing Plan -> Apply -> FabricDeploy
+  # before the next begins: dev -> nonprod -> prod.
+  #
+  # Fabric deploy mechanism per environment:
+  #   dev     - git-sync: pull the latest ADO commit into the Dev workspace
+  #   nonprod - pipeline-deploy: wire the pipeline (dev+nonprod) and promote Dev -> Test
+  #   prod    - pipeline-deploy: wire the pipeline (dev+nonprod+prod) and promote Test -> Production
+  # ---------------------------- Dev ----------------------------
+  - template: .azuredevops/templates/fabric-env-stages.yml
+    parameters:
+      environment: 'dev'
+      workingDirectory: '$(Build.SourcesDirectory)/Terraform/workspaces/dev'
+      serviceConnection: '$(serviceConnection)'
+      backendResourceGroup: '$(backendResourceGroup)'
+      backendStorageAccount: '$(backendStorageAccount)'
+      backendContainerName: '$(backendContainerName)'
+      backendKey: 'fabric/dev.tfstate'
+      fabricDeployMode: 'git-sync'
+
+  # -------------------------- Non-Prod -------------------------
+  - template: .azuredevops/templates/fabric-env-stages.yml
+    parameters:
+      environment: 'nonprod'
+      workingDirectory: '$(Build.SourcesDirectory)/Terraform/workspaces/nonprod'
+      serviceConnection: '$(serviceConnection)'
+      backendResourceGroup: '$(backendResourceGroup)'
+      backendStorageAccount: '$(backendStorageAccount)'
+      backendContainerName: '$(backendContainerName)'
+      backendKey: 'fabric/nonprod.tfstate'
+      fabricDeployMode: 'pipeline-deploy'
+      activeEnvironments: '["dev","nonprod"]'
+      sourceStage: 'Development'
+      targetStage: 'Test'
+      dependsOn:
+        - FabricDeploy_dev
+
+  # ---------------------------- Prod ---------------------------
+  - template: .azuredevops/templates/fabric-env-stages.yml
+    parameters:
+      environment: 'prod'
+      workingDirectory: '$(Build.SourcesDirectory)/Terraform/workspaces/prod'
+      serviceConnection: '$(serviceConnection)'
+      backendResourceGroup: '$(backendResourceGroup)'
+      backendStorageAccount: '$(backendStorageAccount)'
+      backendContainerName: '$(backendContainerName)'
+      backendKey: 'fabric/prod.tfstate'
+      fabricDeployMode: 'pipeline-deploy'
+      activeEnvironments: '["dev","nonprod","prod"]'
+      sourceStage: 'Test'
+      targetStage: 'Production'
+      dependsOn:
+        - FabricDeploy_nonprod

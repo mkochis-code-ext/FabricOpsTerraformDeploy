@@ -1,0 +1,5 @@
+# Example backend configuration for the deployment pipeline root.
+resource_group_name  = "rg-fabricops-tfstate"
+storage_account_name = "stfabricopstfstate"
+container_name       = "tfstate"
+key                  = "fabric/deployment-pipeline.tfstate"

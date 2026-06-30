@@ -1,0 +1,269 @@
+# Reusable template that emits independent stages for a single workspace environment:
+#   1. Plan          - terraform init + plan of the workspace root
+#   2. Apply         - terraform apply of the workspace root
+#   3. FabricDeploy  - content deploy, by mode:
+#                        git-sync       : Update From Git (ADO -> Dev workspace)
+#                        pipeline-deploy : apply the deployment pipeline, then promote
+#                                          content between stages via the Deploy API
+#                        none            : no content deploy
+#
+# Each environment is wired through this template from azure-pipelines.yml.
+
+parameters:
+  - name: environment        # Logical name: dev | nonprod | prod
+    type: string
+  - name: workingDirectory   # Path to the workspace Terraform root for this environment
+    type: string
+  - name: serviceConnection  # Azure DevOps service connection (Workload Identity Federation)
+    type: string
+  - name: backendResourceGroup
+    type: string
+  - name: backendStorageAccount
+    type: string
+  - name: backendContainerName
+    type: string
+  - name: backendKey         # Backend state key for the workspace root
+    type: string
+  - name: fabricDeployMode   # none | git-sync | pipeline-deploy
+    type: string
+    default: 'none'
+  # --- pipeline-deploy mode only ---
+  - name: pipelineWorkingDirectory  # Path to the deployment_pipeline Terraform root
+    type: string
+    default: '$(Build.SourcesDirectory)/Terraform/deployment_pipeline'
+  - name: pipelineBackendKey        # Backend state key for the deployment pipeline root
+    type: string
+    default: 'fabric/deployment-pipeline.tfstate'
+  - name: activeEnvironments        # HCL list passed to -var, e.g. '["dev","nonprod"]'
+    type: string
+    default: '[]'
+  - name: sourceStage               # Source stage display name for the promotion
+    type: string
+    default: ''
+  - name: targetStage               # Target stage display name for the promotion
+    type: string
+    default: ''
+  - name: dependsOn
+    type: object
+    default: []
+
+stages:
+  # -------------------------------------------------------------------------
+  # Plan
+  # -------------------------------------------------------------------------
+  - stage: Plan_${{ parameters.environment }}
+    displayName: 'Plan - ${{ parameters.environment }}'
+    dependsOn: ${{ parameters.dependsOn }}
+    jobs:
+      - job: terraform_plan
+        displayName: 'Terraform Plan'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform'
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Init & Plan'
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              addSpnToEnvironment: true
+              workingDirectory: ${{ parameters.workingDirectory }}
+              inlineScript: |
+                set -euo pipefail
+
+                # Surface the federated credentials to both Terraform's azurerm backend
+                # and the Fabric provider (OIDC).
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_USE_OIDC=true
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+                export FABRIC_TENANT_ID="$tenantId"
+                export FABRIC_CLIENT_ID="$servicePrincipalId"
+                export FABRIC_OIDC_TOKEN="$idToken"
+                export FABRIC_USE_OIDC=true
+
+                terraform init -input=false \
+                  -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
+                  -backend-config="storage_account_name=${{ parameters.backendStorageAccount }}" \
+                  -backend-config="container_name=${{ parameters.backendContainerName }}" \
+                  -backend-config="key=${{ parameters.backendKey }}"
+
+                terraform plan -input=false -out=tfplan \
+                  -var="tenant_id=$tenantId" \
+                  -var="client_id=$servicePrincipalId" \
+                  -var="use_oidc=true"
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Terraform Plan'
+            inputs:
+              targetPath: ${{ parameters.workingDirectory }}
+              artifact: 'tfplan-${{ parameters.environment }}'
+
+  # -------------------------------------------------------------------------
+  # Apply
+  # -------------------------------------------------------------------------
+  - stage: Apply_${{ parameters.environment }}
+    displayName: 'Apply - ${{ parameters.environment }}'
+    dependsOn: Plan_${{ parameters.environment }}
+    jobs:
+      - deployment: terraform_apply
+        displayName: 'Terraform Apply'
+        environment: 'fabric-${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform'
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - download: current
+                  artifact: 'tfplan-${{ parameters.environment }}'
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    addSpnToEnvironment: true
+                    workingDirectory: ${{ parameters.workingDirectory }}
+                    inlineScript: |
+                      set -euo pipefail
+
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_USE_OIDC=true
+                      export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+                      export FABRIC_TENANT_ID="$tenantId"
+                      export FABRIC_CLIENT_ID="$servicePrincipalId"
+                      export FABRIC_OIDC_TOKEN="$idToken"
+                      export FABRIC_USE_OIDC=true
+
+                      terraform init -input=false \
+                        -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
+                        -backend-config="storage_account_name=${{ parameters.backendStorageAccount }}" \
+                        -backend-config="container_name=${{ parameters.backendContainerName }}" \
+                        -backend-config="key=${{ parameters.backendKey }}"
+
+                      # Copy the plan artifact next to the working directory and apply it.
+                      cp "$(Pipeline.Workspace)/tfplan-${{ parameters.environment }}/tfplan" ./tfplan
+                      terraform apply -input=false -auto-approve tfplan
+
+                      # Persist the workspace ID for the fabric-deploy stage.
+                      terraform output -raw workspace_id > "$(Build.ArtifactStagingDirectory)/workspace_id.txt"
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish Terraform Outputs'
+                  inputs:
+                    targetPath: '$(Build.ArtifactStagingDirectory)/workspace_id.txt'
+                    artifact: 'tfoutput-${{ parameters.environment }}'
+
+  # -------------------------------------------------------------------------
+  # Fabric Deploy
+  #   git-sync        : pull the latest ADO commit into the Dev workspace
+  #   pipeline-deploy : apply the deployment pipeline (wiring active stages),
+  #                     then promote content from sourceStage -> targetStage
+  # -------------------------------------------------------------------------
+  - ${{ if ne(parameters.fabricDeployMode, 'none') }}:
+    - stage: FabricDeploy_${{ parameters.environment }}
+      displayName: 'Fabric Deploy - ${{ parameters.environment }}'
+      dependsOn: Apply_${{ parameters.environment }}
+      jobs:
+        - deployment: fabric_deploy
+          displayName: 'Fabric Deploy'
+          environment: 'fabric-${{ parameters.environment }}'
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: self
+
+                  - download: current
+                    artifact: 'tfoutput-${{ parameters.environment }}'
+
+                  # ---------------------- git-sync (Dev) ----------------------
+                  - ${{ if eq(parameters.fabricDeployMode, 'git-sync') }}:
+                    - task: AzureCLI@2
+                      displayName: 'Update Workspace From Git'
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: 'pscore'
+                        scriptLocation: 'inlineScript'
+                        inlineScript: |
+                          $ErrorActionPreference = 'Stop'
+                          $env:FABRIC_WORKSPACE_ID = (Get-Content "$(Pipeline.Workspace)/tfoutput-${{ parameters.environment }}/workspace_id.txt" -Raw).Trim()
+                          $env:FABRIC_TOKEN = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
+                          ./scripts/Invoke-FabricGitSync.ps1
+
+                  # ------------- pipeline-deploy (Non-Prod / Prod) ------------
+                  - ${{ if eq(parameters.fabricDeployMode, 'pipeline-deploy') }}:
+                    - task: TerraformInstaller@1
+                      displayName: 'Install Terraform'
+                      inputs:
+                        terraformVersion: 'latest'
+
+                    - task: AzureCLI@2
+                      displayName: 'Apply Deployment Pipeline'
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: 'bash'
+                        scriptLocation: 'inlineScript'
+                        addSpnToEnvironment: true
+                        workingDirectory: ${{ parameters.pipelineWorkingDirectory }}
+                        inlineScript: |
+                          set -euo pipefail
+
+                          export ARM_TENANT_ID="$tenantId"
+                          export ARM_CLIENT_ID="$servicePrincipalId"
+                          export ARM_OIDC_TOKEN="$idToken"
+                          export ARM_USE_OIDC=true
+                          export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+
+                          export FABRIC_TENANT_ID="$tenantId"
+                          export FABRIC_CLIENT_ID="$servicePrincipalId"
+                          export FABRIC_OIDC_TOKEN="$idToken"
+                          export FABRIC_USE_OIDC=true
+
+                          terraform init -input=false \
+                            -backend-config="resource_group_name=${{ parameters.backendResourceGroup }}" \
+                            -backend-config="storage_account_name=${{ parameters.backendStorageAccount }}" \
+                            -backend-config="container_name=${{ parameters.backendContainerName }}" \
+                            -backend-config="key=${{ parameters.pipelineBackendKey }}"
+
+                          terraform apply -input=false -auto-approve \
+                            -var="tenant_id=$tenantId" \
+                            -var="client_id=$servicePrincipalId" \
+                            -var="use_oidc=true" \
+                            -var="backend_resource_group_name=${{ parameters.backendResourceGroup }}" \
+                            -var="backend_storage_account_name=${{ parameters.backendStorageAccount }}" \
+                            -var="backend_container_name=${{ parameters.backendContainerName }}" \
+                            -var='active_environments=${{ parameters.activeEnvironments }}'
+
+                          terraform output -raw deployment_pipeline_id > "$(Build.ArtifactStagingDirectory)/pipeline_id.txt"
+                          terraform output -json deployment_pipeline_stages > "$(Build.ArtifactStagingDirectory)/stages.json"
+
+                    - task: AzureCLI@2
+                      displayName: 'Promote ${{ parameters.sourceStage }} -> ${{ parameters.targetStage }}'
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: 'pscore'
+                        scriptLocation: 'inlineScript'
+                        inlineScript: |
+                          $ErrorActionPreference = 'Stop'
+                          $env:FABRIC_PIPELINE_ID = (Get-Content "$(Build.ArtifactStagingDirectory)/pipeline_id.txt" -Raw).Trim()
+                          $env:FABRIC_STAGES_JSON = Get-Content "$(Build.ArtifactStagingDirectory)/stages.json" -Raw
+                          $env:FABRIC_SOURCE_STAGE = '${{ parameters.sourceStage }}'
+                          $env:FABRIC_TARGET_STAGE = '${{ parameters.targetStage }}'
+                          $env:FABRIC_TOKEN = az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv
+                          ./scripts/Invoke-FabricDeployStage.ps1

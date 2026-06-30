@@ -1,0 +1,46 @@
+tenant_id = "00000000-0000-0000-0000-000000000000"
+client_id = "00000000-0000-0000-0000-000000000000"
+use_oidc  = true
+
+# Remote state location for the environment workspaces (used to ingest workspace IDs).
+backend_resource_group_name  = "rg-fabricops-tfstate"
+backend_storage_account_name = "stfabricopstfstate"
+backend_container_name       = "tfstate"
+
+# Optional: override the state file keys if they differ from the defaults.
+# state_keys = {
+#   dev     = "fabric/dev.tfstate"
+#   nonprod = "fabric/nonprod.tfstate"
+#   prod    = "fabric/prod.tfstate"
+# }
+
+deployment_pipeline_display_name = "FabricOps-Pipeline"
+deployment_pipeline_description  = "Deployment pipeline managed by Terraform."
+
+# Environments currently wired into the pipeline. The CI pipeline grows this as
+# environments come online: ["dev","nonprod"] for the Non-Prod promotion, then
+# ["dev","nonprod","prod"] for the Prod promotion (which recreates the pipeline).
+active_environments = ["dev", "nonprod", "prod"]
+
+# Stage names are predefined; the workspace ID is ingested from each environment's
+# remote state via source_environment.
+stages = [
+  {
+    display_name       = "Development"
+    description        = "Development stage."
+    is_public          = false
+    source_environment = "dev"
+  },
+  {
+    display_name       = "Test"
+    description        = "Test stage."
+    is_public          = false
+    source_environment = "nonprod"
+  },
+  {
+    display_name       = "Production"
+    description        = "Production stage."
+    is_public          = true
+    source_environment = "prod"
+  }
+]

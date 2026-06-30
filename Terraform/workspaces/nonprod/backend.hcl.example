@@ -1,0 +1,5 @@
+# Example backend configuration for the Non-Prod environment.
+resource_group_name  = "rg-fabricops-tfstate"
+storage_account_name = "stfabricopstfstate"
+container_name       = "tfstate"
+key                  = "fabric/nonprod.tfstate"

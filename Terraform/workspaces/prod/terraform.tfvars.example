@@ -1,0 +1,9 @@
+tenant_id = "00000000-0000-0000-0000-000000000000"
+client_id = "00000000-0000-0000-0000-000000000000"
+use_oidc  = true
+
+workspace_display_name = "FabricOps-Prod"
+workspace_description  = "Production workspace managed by Terraform."
+
+# Optional: assign a dedicated capacity.
+# capacity_id = "00000000-0000-0000-0000-000000000000"
