@@ -5,7 +5,7 @@ environments (Dev, Non-Prod, Prod) and promoting content between them through a
 **Fabric deployment pipeline** — all orchestrated by a single Azure DevOps pipeline.
 
 - **Terraform** (with the [`microsoft/fabric`](https://registry.terraform.io/providers/microsoft/fabric/latest/docs) provider) defines the desired state: the workspaces, their Git connection, and the deployment pipeline.
-- **Azure DevOps** runs `plan` → `apply` → `fabric-deploy` for each environment, strictly in order.
+- **Azure DevOps** runs `deploy` (plan + conditional-approval apply) → `fabric-deploy` for each environment, strictly in order.
 - **PowerShell** scripts perform the imperative Fabric REST actions (Git sync and stage promotion) that Terraform cannot model declaratively.
 
 ---
@@ -60,13 +60,19 @@ flowchart LR
 ## How it deploys
 
 The Azure DevOps pipeline ([azure-pipelines.yml](azure-pipelines.yml)) processes the three
-environments **sequentially** — Non-Prod only starts after Dev's Fabric deploy succeeds, and
-Prod only after Non-Prod's. Each environment expands into three stages from the reusable
-template [.azuredevops/templates/fabric-env-stages.yml](.azuredevops/templates/fabric-env-stages.yml):
+environments **sequentially** — Non-Prod only starts after Dev's Deploy stage succeeds, and
+Prod only after Non-Prod's. Each environment expands into a single **Deploy** stage from the
+reusable template [.azuredevops/templates/fabric-env-stages.yml](.azuredevops/templates/fabric-env-stages.yml),
+whose jobs run in order:
 
-1. **Plan** — `terraform init` + `terraform plan`, publishing the plan as an artifact.
-2. **Apply** — `terraform apply` of the published plan (gated by an ADO *environment* for approvals), publishing the resulting `workspace_id`.
-3. **FabricDeploy** — the content deploy, which differs by environment:
+1. **Plan** — `terraform init` + `terraform plan -detailed-exitcode`, publishing the plan as an
+   artifact and recording whether there are changes.
+2. **Approve** — a manual approval (`ManualValidation`) that pauses the stage, **only** when the
+   plan reports changes.
+3. **Apply** — `terraform apply` of the saved plan, publishing the resulting `workspace_id`.
+   Skipped automatically when the plan reports no changes.
+4. **FabricDeploy** — the content deploy, which differs by environment. Runs when the plan
+   succeeded and the apply either succeeded or was skipped (no changes):
 
 | Environment | `fabricDeployMode` | What happens |
 |-------------|--------------------|--------------|
@@ -102,7 +108,7 @@ FabricOpsTerraformDeploy/
 ├── azure-pipelines.yml              # Root ADO pipeline (dev → nonprod → prod)
 ├── .azuredevops/
 │   └── templates/
-│       └── fabric-env-stages.yml    # Reusable Plan/Apply/FabricDeploy template
+│       └── fabric-env-stages.yml    # Reusable per-environment Deploy stage template
 ├── Fabric/                          # Fabric item definitions tracked in Git (Dev source)
 ├── scripts/
 │   ├── FabricApi.ps1                # Shared Fabric REST helpers (token, request, LRO polling)
@@ -205,9 +211,11 @@ group holds **no secrets** — only identifiers and names.
 | `backendContainerName` | `tfstate` | `terraform init` backend |
 | `git_connection_id` | `11111111-1111-1111-1111-111111111111` | Dev workspace Git integration |
 | `git_organization_name` | `MyOrg` | Dev workspace Git integration |
-| `git_project_name` | `MyProject` | Dev workspace Git integration |
-| `git_repository_name` | `FabricOpsTerraformDeploy` | Dev workspace Git integration |
 | `git_branch_name` | `main` | Dev workspace Git integration |
+
+> The ADO **project** and **repository** for the Dev workspace Git integration are read from the
+> built-in pipeline variables `$(System.TeamProject)` and `$(Build.Repository.Name)`, so they are
+> **not** stored in the variable group.
 
 Create and populate it with the Azure CLI (`az devops` extension):
 
@@ -224,8 +232,6 @@ az pipelines variable-group create `
     backendContainerName=tfstate `
     git_connection_id=11111111-1111-1111-1111-111111111111 `
     git_organization_name=MyOrg `
-    git_project_name=MyProject `
-    git_repository_name=FabricOpsTerraformDeploy `
     git_branch_name=main
 ```
 
@@ -242,9 +248,16 @@ az pipelines variable-group variable update `
 
 ### 5. Create ADO environments for approvals (optional but recommended)
 
-The Apply and FabricDeploy stages target ADO *environments* named `fabric-dev`,
-`fabric-nonprod`, and `fabric-prod`. Create these under **Pipelines → Environments** and add
-approval checks where you want manual gates (typically Non-Prod and Prod).
+The Deploy stage's apply and fabric-deploy jobs target ADO *environments* named
+`fabric-dev`, `fabric-nonprod`, and `fabric-prod`. Create these under **Pipelines →
+Environments** for deployment history and access control.
+
+Approval for the Terraform apply is handled **inside** the Deploy stage by a conditional
+`ManualValidation` gate that only pauses when the plan reports changes — so a no-op run proceeds
+to the fabric deploy without prompting. Avoid adding *approval checks* on these environments (those
+fire at stage entry regardless of whether there are changes, which would defeat the
+skip-when-unchanged behaviour). To skip the manual gate for an environment, pass
+`requireApproval: false` to the template.
 
 ### 6. Provide environment configuration (local runs only)
 
@@ -338,13 +351,16 @@ $env:FABRIC_WORKSPACE_ID = terraform output -raw workspace_id
 ```mermaid
 flowchart TD
     subgraph DEV[Dev]
-      P1[Plan] --> A1[Apply] --> F1[FabricDeploy: git-sync]
+      P1[Plan] -->|changes| G1{{Approve}} --> A1[Apply] --> F1[Fabric deploy: git-sync]
+      P1 -->|no changes| F1
     end
     subgraph NP[Non-Prod]
-      P2[Plan] --> A2[Apply] --> F2[FabricDeploy: apply pipeline dev+nonprod<br/>then promote Development → Test]
+      P2[Plan] -->|changes| G2{{Approve}} --> A2[Apply] --> F2[Fabric deploy: apply pipeline dev+nonprod<br/>then promote Development → Test]
+      P2 -->|no changes| F2
     end
     subgraph PR[Prod]
-      P3[Plan] --> A3[Apply] --> F3[FabricDeploy: apply pipeline dev+nonprod+prod<br/>then promote Test → Production]
+      P3[Plan] -->|changes| G3{{Approve}} --> A3[Apply] --> F3[Fabric deploy: apply pipeline dev+nonprod+prod<br/>then promote Test → Production]
+      P3 -->|no changes| F3
     end
     F1 --> P2
     F2 --> P3

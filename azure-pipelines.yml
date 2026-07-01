@@ -1,9 +1,11 @@
 # Azure DevOps pipeline that deploys Fabric workspaces with Terraform.
 #
-# For each workspace environment (dev, nonprod, prod) the pipeline runs three stages:
-#   1. Plan         - terraform init + plan
-#   2. Apply        - terraform apply
-#   3. FabricDeploy - publish Fabric item definitions to the workspace
+# For each workspace environment (dev, nonprod, prod) the pipeline runs a single Deploy
+# stage whose jobs execute in order:
+#   1. terraform init + plan
+#   2. a manual-approval gate, only when the plan reports changes
+#   3. terraform apply (skipped automatically when the plan reports no changes)
+#   4. the Fabric content deploy (publish item definitions to the workspace)
 #
 # Environments are deployed sequentially: nonprod depends on dev, prod depends on nonprod.
 # Stage logic lives in .azuredevops/templates/fabric-env-stages.yml.
@@ -36,9 +38,10 @@ variables:
   #   admin_security_group_id  - Entra group object ID granted Admin on workspaces & pipeline
   #   git_connection_id        - Fabric connection ID for the Dev workspace Git integration
   #   git_organization_name    - Azure DevOps organization backing the Dev workspace
-  #   git_project_name         - Azure DevOps project backing the Dev workspace
-  #   git_repository_name      - Azure DevOps repository backing the Dev workspace
   #   git_branch_name          - Branch the Dev workspace tracks
+  # The ADO project and repository are read from the built-in pipeline variables
+  # ($(System.TeamProject) and $(Build.Repository.Name)), so they no longer need to
+  # be defined in the variable group.
   - group: fabricops-config
   # Terraform version, used as the hashicorp/terraform container image tag. Terraform runs
   # via `docker run` inside the AzureCLI tasks (the TerraformInstaller marketplace task is
@@ -47,8 +50,9 @@ variables:
     value: '1.9.8'
 
 stages:
-  # Environments run sequentially, each fully completing Plan -> Apply -> FabricDeploy
-  # before the next begins: dev -> nonprod -> prod.
+  # Environments run sequentially, each fully completing its Deploy stage
+  # (plan -> approval -> apply -> fabric deploy) before the next begins:
+  # dev -> nonprod -> prod.
   #
   # Fabric deploy mechanism per environment:
   #   dev     - git-sync: pull the latest ADO commit into the Dev workspace
@@ -73,8 +77,8 @@ stages:
         -var="admin_group_id=$(admin_security_group_id)"
         -var="git_connection_id=$(git_connection_id)"
         -var="git_organization_name=$(git_organization_name)"
-        -var="git_project_name=$(git_project_name)"
-        -var="git_repository_name=$(git_repository_name)"
+        -var="git_project_name=$(System.TeamProject)"
+        -var="git_repository_name=$(Build.Repository.Name)"
         -var="git_branch_name=$(git_branch_name)"
 
   # -------------------------- Non-Prod -------------------------
@@ -97,7 +101,7 @@ stages:
         -var="capacity_id=$(fabric_capacity_id)"
         -var="admin_group_id=$(admin_security_group_id)"
       dependsOn:
-        - FabricDeploy_dev
+        - Deploy_dev
 
   # ---------------------------- Prod ---------------------------
   - template: .azuredevops/templates/fabric-env-stages.yml
@@ -119,4 +123,4 @@ stages:
         -var="capacity_id=$(fabric_capacity_id)"
         -var="admin_group_id=$(admin_security_group_id)"
       dependsOn:
-        - FabricDeploy_nonprod
+        - Deploy_nonprod

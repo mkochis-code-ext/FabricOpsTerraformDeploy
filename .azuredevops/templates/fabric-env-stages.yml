@@ -1,11 +1,13 @@
-# Reusable template that emits independent stages for a single workspace environment:
-#   1. Plan          - terraform init + plan of the workspace root
-#   2. Apply         - terraform apply of the workspace root
-#   3. FabricDeploy  - content deploy, by mode:
-#                        git-sync       : Update From Git (ADO -> Dev workspace)
-#                        pipeline-deploy : apply the deployment pipeline, then promote
-#                                          content between stages via the Deploy API
-#                        none            : no content deploy
+# Reusable template that emits a single stage for a workspace environment:
+#   Deploy - runs these jobs in order:
+#     1. terraform plan of the workspace root
+#     2. a manual-approval gate, only when the plan reports changes
+#     3. terraform apply (skipped automatically when the plan reports no changes)
+#     4. the Fabric content deploy, by mode:
+#          git-sync        : Update From Git (ADO -> Dev workspace)
+#          pipeline-deploy : apply the deployment pipeline, then promote
+#                            content between stages via the Deploy API
+#          none            : no content deploy
 #
 # Each environment is wired through this template from azure-pipelines.yml.
 
@@ -46,22 +48,47 @@ parameters:
   - name: targetStage               # Target stage display name for the promotion
     type: string
     default: ''
+  # --- approval gate ---
+  - name: requireApproval           # Pause for manual approval before apply when the plan has changes
+    type: boolean
+    default: true
+  - name: approvalNotifyUsers       # Optional list of users/groups to notify for the approval
+    type: string
+    default: ''
   - name: dependsOn
     type: object
     default: []
 
 stages:
   # -------------------------------------------------------------------------
-  # Plan
+  # Deploy (plan + conditional approval + apply + fabric deploy)
+  #
+  #   1. terraform_plan   - init + `plan -detailed-exitcode`. Sets the output
+  #                         variable hasChanges (true/false). When there are no
+  #                         changes it also captures the current workspace_id from
+  #                         state, because the apply job (which normally publishes it)
+  #                         is skipped.
+  #   2. wait_for_approval - agentless ManualValidation job that pauses for approval,
+  #                          but ONLY when the plan reported changes and requireApproval
+  #                          is true. Skipped entirely when there is nothing to apply.
+  #   3. terraform_apply  - applies the saved plan, but only when the plan reported
+  #                         changes and the approval succeeded (or was not required).
+  #   4. fabric_deploy    - content deploy (git-sync or pipeline-deploy). Runs when the
+  #                         plan succeeded and the apply either succeeded or was skipped
+  #                         (no changes); skipped if the approval was rejected.
+  #
+  # When the plan reports no changes, both the approval and apply are skipped and the
+  # stage proceeds straight to the fabric deploy.
   # -------------------------------------------------------------------------
-  - stage: Plan_${{ parameters.environment }}
-    displayName: 'Plan - ${{ parameters.environment }}'
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy - ${{ parameters.environment }}'
     dependsOn: ${{ parameters.dependsOn }}
     jobs:
       - job: terraform_plan
         displayName: 'Terraform Plan'
         steps:
           - task: AzureCLI@2
+            name: plan
             displayName: 'Terraform Init & Plan'
             inputs:
               azureSubscription: ${{ parameters.serviceConnection }}
@@ -105,11 +132,29 @@ stages:
                   -backend-config="container_name=${{ parameters.backendContainerName }}" \
                   -backend-config="key=${{ parameters.backendKey }}"
 
-                terraform plan -input=false -out=tfplan \
+                # `-detailed-exitcode`: 0 = no changes, 1 = error, 2 = changes present.
+                set +e
+                terraform plan -input=false -detailed-exitcode -out=tfplan \
                   -var="tenant_id=$tenantId" \
                   -var="client_id=$servicePrincipalId" \
                   -var="use_oidc=true" \
                   ${{ parameters.terraformVars }}
+                planExitCode=$?
+                set -e
+
+                if [ "$planExitCode" -eq 0 ]; then
+                  echo 'No infrastructure changes detected; apply will be skipped.'
+                  echo "##vso[task.setvariable variable=hasChanges;isOutput=true]false"
+                  # Apply is skipped, so capture the existing workspace_id from state here
+                  # for the FabricDeploy stage.
+                  terraform output -raw workspace_id > "$(Build.ArtifactStagingDirectory)/workspace_id.txt"
+                elif [ "$planExitCode" -eq 2 ]; then
+                  echo 'Infrastructure changes detected; apply is required.'
+                  echo "##vso[task.setvariable variable=hasChanges;isOutput=true]true"
+                else
+                  echo "terraform plan failed with exit code $planExitCode."
+                  exit "$planExitCode"
+                fi
 
           - task: PublishPipelineArtifact@1
             displayName: 'Publish Terraform Plan'
@@ -117,15 +162,43 @@ stages:
               targetPath: ${{ parameters.workingDirectory }}
               artifact: 'tfplan-${{ parameters.environment }}'
 
-  # -------------------------------------------------------------------------
-  # Apply
-  # -------------------------------------------------------------------------
-  - stage: Apply_${{ parameters.environment }}
-    displayName: 'Apply - ${{ parameters.environment }}'
-    dependsOn: Plan_${{ parameters.environment }}
-    jobs:
+          # Only published on the no-change path; on the change path the apply job
+          # publishes the authoritative workspace_id after applying.
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Workspace Id (no-change path)'
+            condition: eq(variables['plan.hasChanges'], 'false')
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/workspace_id.txt'
+              artifact: 'tfoutput-${{ parameters.environment }}'
+
+      # ---------------------------------------------------------------------
+      # Conditional manual approval — only runs when the plan reported changes.
+      # ---------------------------------------------------------------------
+      - job: wait_for_approval
+        displayName: 'Approve Apply'
+        dependsOn: terraform_plan
+        condition: and(succeeded(), eq(dependencies.terraform_plan.outputs['plan.hasChanges'], 'true'), eq('${{ parameters.requireApproval }}', 'true'))
+        pool: server
+        timeoutInMinutes: 4320   # 3 days for the stage to await approval
+        steps:
+          - task: ManualValidation@0
+            displayName: 'Approve Terraform Apply - ${{ parameters.environment }}'
+            timeoutInMinutes: 1440   # auto-reject after 1 day of no response
+            inputs:
+              notifyUsers: ${{ parameters.approvalNotifyUsers }}
+              instructions: 'Terraform detected changes for the ${{ parameters.environment }} workspace. Review the plan, then approve to apply or reject to cancel.'
+              onTimeout: 'reject'
+
+      # ---------------------------------------------------------------------
+      # Apply — only runs when the plan reported changes and the approval either
+      # succeeded or was not required (wait_for_approval skipped).
+      # ---------------------------------------------------------------------
       - deployment: terraform_apply
         displayName: 'Terraform Apply'
+        dependsOn:
+          - terraform_plan
+          - wait_for_approval
+        condition: and(eq(dependencies.terraform_plan.outputs['plan.hasChanges'], 'true'), in(dependencies.wait_for_approval.result, 'Succeeded', 'Skipped'))
         environment: 'fabric-${{ parameters.environment }}'
         strategy:
           runOnce:
@@ -158,7 +231,7 @@ stages:
                       export FABRIC_OIDC_TOKEN="$idToken"
                       export FABRIC_USE_OIDC=true
 
-                      # Run Terraform through the official container image (see Plan stage).
+                      # Run Terraform through the official container image (see Plan job).
                       TF_IMAGE="hashicorp/terraform:$(TF_VERSION)"
                       REPO_ROOT="$(Build.SourcesDirectory)"
                       terraform() {
@@ -188,19 +261,23 @@ stages:
                     targetPath: '$(Build.ArtifactStagingDirectory)/workspace_id.txt'
                     artifact: 'tfoutput-${{ parameters.environment }}'
 
-  # -------------------------------------------------------------------------
-  # Fabric Deploy
-  #   git-sync        : pull the latest ADO commit into the Dev workspace
-  #   pipeline-deploy : apply the deployment pipeline (wiring active stages),
-  #                     then promote content from sourceStage -> targetStage
-  # -------------------------------------------------------------------------
-  - ${{ if ne(parameters.fabricDeployMode, 'none') }}:
-    - stage: FabricDeploy_${{ parameters.environment }}
-      displayName: 'Fabric Deploy - ${{ parameters.environment }}'
-      dependsOn: Apply_${{ parameters.environment }}
-      jobs:
+      # ---------------------------------------------------------------------
+      # Fabric Deploy (final jobs in this stage)
+      #   git-sync        : pull the latest ADO commit into the Dev workspace
+      #   pipeline-deploy : apply the deployment pipeline (wiring active stages),
+      #                     then promote content from sourceStage -> targetStage
+      # Runs after the infra jobs when the plan succeeded and the apply either
+      # succeeded or was skipped (no changes). Skipped if the approval was rejected
+      # or the plan failed.
+      # ---------------------------------------------------------------------
+      - ${{ if ne(parameters.fabricDeployMode, 'none') }}:
         - deployment: fabric_deploy
           displayName: 'Fabric Deploy'
+          dependsOn:
+            - terraform_plan
+            - wait_for_approval
+            - terraform_apply
+          condition: and(eq(dependencies.terraform_plan.result, 'Succeeded'), in(dependencies.wait_for_approval.result, 'Succeeded', 'Skipped'), in(dependencies.terraform_apply.result, 'Succeeded', 'Skipped'))
           environment: 'fabric-${{ parameters.environment }}'
           strategy:
             runOnce:
